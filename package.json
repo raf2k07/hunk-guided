@@ -1,0 +1,30 @@
+{
+  "name": "hunk-review-plugin",
+  "version": "1.0.0",
+  "description": "Agent-authored semantic sections and guided file review for Hunk",
+  "private": true,
+  "packageManager": "pnpm@11.13.0",
+  "hunk": {
+    "extensions": ["./src/index.tsx"],
+    "apiVersion": 27
+  },
+  "scripts": {
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "test:smoke": "tsx tests/hunk-smoke.ts"
+  },
+  "keywords": ["hunk-extension", "guided-review"],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@opentui/core": "0.5.14",
+    "@opentui/react": "0.5.14",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "hunkdiff": "0.23.0",
+    "react": "19.3.0",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

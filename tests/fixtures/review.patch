@@ -1,0 +1,14 @@
+diff --git a/src/api.ts b/src/api.ts
+index 1111111..2222222 100644
+--- a/src/api.ts
++++ b/src/api.ts
+@@ -1 +1 @@
+-export const authorized = false;
++export const authorized = true;
+diff --git a/tests/api.test.ts b/tests/api.test.ts
+index 3333333..4444444 100644
+--- a/tests/api.test.ts
++++ b/tests/api.test.ts
+@@ -1 +1 @@
+-expect(authorized).toBe(false);
++expect(authorized).toBe(true);

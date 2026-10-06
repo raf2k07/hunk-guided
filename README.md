@@ -1,5 +1,10 @@
 # Hunk guided review
 
+
+NOTE: This README is AI generated, I will come back to this later and write something that reads better. Leaving it in because there's some important documentation steps
+
+
+
 A Hunk extension that groups **whole files** into semantic review sections.
 An external coding agent produces a JSON guide; the extension uses the same
 section/file order for the diff stream and a dedicated right-hand sidebar.

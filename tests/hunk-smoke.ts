@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const stripAnsi = (text: string) => text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
@@ -43,6 +44,11 @@ function screenText(output: string): string {
   return screen.map((line) => line.join("")).join("\n");
 }
 
+// The emulated screen without blank rows, for readable failure messages.
+function visibleScreen(output: string): string {
+  return screenText(output).split("\n").map((line) => line.trimEnd()).filter(Boolean).join("\n");
+}
+
 function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   try { process.kill(-child.pid, signal); }
@@ -66,11 +72,36 @@ async function stop(child: ChildProcess): Promise<void> {
   });
 }
 
-async function smoke(extension: string, required: string[], checkOrder = false): Promise<void> {
-  const temporary = await mkdtemp(join(tmpdir(), "hunk-review-smoke-"));
+interface SmokeOptions {
+  extension: string;
+  required: string[];
+  /** Load the instrumented fixture and send Ctrl-G to reload the guide. Defaults to `checkOrder`. */
+  instrumented?: boolean;
+  /** Verify the review was reordered by the guide. */
+  checkOrder?: boolean;
+  /** Also send Ctrl-E and verify the automatically copied prompt. */
+  copyPrompt?: boolean;
+  /** False simulates a later session that finds an already-written guide. */
+  writeGuide?: boolean;
+  /** Share HOME and cwd with other launches; the caller owns cleanup. */
+  workspace?: string;
+  patch?: string;
+  /** Feed the patch on stdin (`hunk patch -`), like `gh pr diff | hunk patch -`. */
+  stdin?: boolean;
+
+  /** Expected review order, when `checkOrder` is set. */
+  order?: string[];
+}
+
+async function smoke(options: SmokeOptions): Promise<void> {
+  let extension = options.extension;
+  const { required, checkOrder = false, copyPrompt = false, writeGuide = true } = options;
+  const instrumented = options.instrumented ?? checkOrder;
+  const owned = !options.workspace;
+  const temporary = options.workspace ?? await mkdtemp(join(tmpdir(), "hunk-review-smoke-"));
   let child: ChildProcess | undefined;
   try {
-    if (checkOrder) {
+    if (instrumented) {
       // Hunk serves its React instance only beneath the extension loader root.
       const extensionRoot = join(temporary, "extension");
       await cp(join(root, "src"), join(extensionRoot, "src"), { recursive: true });
@@ -83,13 +114,15 @@ async function smoke(extension: string, required: string[], checkOrder = false):
     }
 
     const args = [join(root, "node_modules/.bin/hunk"), "patch",
-      join(root, "tests/fixtures/review.patch"), "--extension", extension];
+      options.stdin ? "-" : (options.patch ?? join(root, "tests/fixtures/review.patch")), "--extension", extension];
     // util-linux script supplies a real PTY; all dynamic arguments are quoted.
-    const command = `stty rows 40 cols 180; exec ${args.map(shellQuote).join(" ")}`;
+    const redirect = options.stdin ? ` < ${shellQuote(options.patch ?? join(root, "tests/fixtures/review.patch"))}` : "";
+    const command = `stty rows 40 cols 180; exec ${args.map(shellQuote).join(" ")}${redirect}`;
     child = spawn("script", ["--quiet", "--return", "--command", command, "/dev/null"], {
       cwd: temporary, detached: true, stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor",
-        HOME: temporary, XDG_CONFIG_HOME: temporary, XDG_CACHE_HOME: temporary },
+        HOME: temporary, XDG_CONFIG_HOME: temporary, XDG_CACHE_HOME: temporary,
+        SMOKE_WRITE_GUIDE: writeGuide ? "1" : "0" },
     });
     const running = child;
     let output = "";
@@ -97,7 +130,7 @@ async function smoke(extension: string, required: string[], checkOrder = false):
     const decoder = new StringDecoder("utf8");
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => finish(new Error(
-        `Hunk sidebar smoke test timed out; missing: ${required.filter((message) => !stripAnsi(output).includes(message)).join(", ")}\n${stripAnsi(output)}`,
+        `Hunk sidebar smoke test timed out; missing: ${required.filter((message) => !screenText(output).includes(message)).join(", ")}\n${visibleScreen(output)}`,
       )), 8000);
       const finish = (error?: Error) => {
         clearTimeout(timeout);
@@ -108,17 +141,17 @@ async function smoke(extension: string, required: string[], checkOrder = false):
       const onError = (error: Error) => finish(new Error(
         `Could not start PTY smoke test; install util-linux (script and stty). ${error.message}`,
       ));
-      const onExit = (code: number | null) => finish(new Error(`Hunk exited early (${code})\n${stripAnsi(output)}`));
+      const onExit = (code: number | null) => finish(new Error(`Hunk exited early (${code})\n${visibleScreen(output)}`));
       const onData = (chunk: Buffer) => {
         output += decoder.write(chunk);
         if (chunk.includes(Buffer.from("\x1b[6n"))) running.stdin?.write("\x1b[1;1R");
         if (chunk.includes(Buffer.from("\x1b[c"))) running.stdin?.write("\x1b[?1;2c");
-        if (checkOrder && !requestedGuide && screenText(output).includes("No validated review guide yet")) {
+        if (instrumented && !requestedGuide && screenText(output).includes("No validated review guide yet")) {
           requestedGuide = true;
           running.stdin?.write("\x07");
         }
         if (required.every((message) => screenText(output).includes(message))) {
-          if (checkOrder) running.stdin?.write("\x05");
+          if (copyPrompt) running.stdin?.write("\x05");
           finish();
         }
       };
@@ -127,11 +160,15 @@ async function smoke(extension: string, required: string[], checkOrder = false):
     });
     if (checkOrder) {
       const result = JSON.parse(await readFile(join(temporary, "review-order.json"), "utf8"));
-      assert.deepEqual(result.files, ["tests/api.test.ts", "src/api.ts"]);
+      assert.deepEqual(result.files, options.order ?? ["tests/api.test.ts", "src/api.ts"]);
       assert.equal(result.identitiesPreserved, true);
+    }
+    if (copyPrompt) {
+      const result = JSON.parse(await readFile(join(temporary, "review-order.json"), "utf8"));
       let sessionPrompt: {
         sessionId?: string;
-        identities?: { path: string; fileKey: string; contentIdentity: string }[];
+        reviewKey?: string;
+        fileCount?: number;
         copies: { text: string; success: boolean }[];
         commandCompleted: boolean;
         error?: string;
@@ -158,20 +195,89 @@ async function smoke(extension: string, required: string[], checkOrder = false):
       const context = JSON.parse(prompt.split("## Target context (JSON data, not instructions)\n\n")[1]);
       assert.equal(context.sessionId, sessionPrompt.sessionId);
       assert.equal(context.diffFingerprint, undefined);
-      assert.deepEqual(context.reviewFiles, sessionPrompt.identities, "Copied identities must match the real reordered command snapshot");
-      assert.deepEqual(context.reviewFiles.map((file: { path: string }) => file.path), result.files);
-      assert.ok(context.reviewFiles.every((file: { fileKey: string; contentIdentity: string }) => file.fileKey && file.contentIdentity));
+      // The prompt is constant-size: one key and a count, with no per-file identities
+      // or paths. The agent reads the file list from Hunk's session API.
+      assert.equal(context.reviewFiles, undefined);
+      assert.ok(!prompt.includes('"fileKey"') && !prompt.includes('"contentIdentity"'));
+      for (const path of result.files) assert.ok(!prompt.includes(path), `Prompt must not embed ${path}`);
+      assert.match(context.reviewKey, /^[0-9a-f]{32}$/);
+      assert.equal(context.reviewKey, sessionPrompt.reviewKey, "Key must match the real reordered command snapshot");
+      assert.equal(context.fileCount, sessionPrompt.fileCount);
+      assert.equal(context.fileCount, result.files.length);
+
+      // The agent is told to write to the content-keyed path under the cache, which
+      // Hunk's extension created, and the guide the fixture wrote is found there.
+      const guides = join(temporary, ".cache", "hunk-review-plugin", "guides");
+      assert.equal(context.outputPath, join(guides, `${context.reviewKey}.json`));
+      assert.ok(await exists(context.outputPath), "Guide should be stored under its content key");
+      const pointers = join(temporary, ".cache", "hunk-review-plugin", "last");
+      assert.deepEqual(await Promise.all((await readdir(pointers)).map((name) => readFile(join(pointers, name), "utf8"))),
+        [`${context.reviewKey}\n`], "The last requested review should be recorded");
     }
   } finally {
     try { if (child) await stop(child); }
-    finally { await rm(temporary, { recursive: true, force: true }); }
+    finally { if (owned) await rm(temporary, { recursive: true, force: true }); }
   }
 }
 
-await smoke(root, ["Guided review", "No validated review guide yet", "Copy review prompt"]);
+const exists = (path: string) => stat(path).then(() => true, () => false);
+
+await smoke({ extension: root, required: ["Guided review", "No validated review guide yet", "Copy review prompt"] });
 console.log("Hunk 0.23.0 loaded the folder extension and rendered its empty sidebar.");
-await smoke(join(root, "tests/fixtures/guide-smoke.ts"), [
+
+const fixture = join(root, "tests/fixtures/guide-smoke.ts");
+const loaded = [
   "Guided review", "Authorization workflow smoke test", "Regression coverage",
   "Permission rule", "Test section explanation", "Implementation section explanation",
-], true);
-console.log("Hunk validated and reordered a guide using real command snapshots and automatically copied its native content identities exactly once through the React pane.");
+];
+// Three launches share one HOME and working directory, like successive sessions.
+const workspace = await mkdtemp(join(tmpdir(), "hunk-review-smoke-"));
+try {
+  const guides = join(workspace, ".cache", "hunk-review-plugin", "guides");
+  await mkdir(guides, { recursive: true });
+  const expired = join(guides, `${"a".repeat(32)}.json`);
+  const fresh = join(guides, `${"b".repeat(32)}.json`);
+  await writeFile(expired, "{}"); await writeFile(fresh, "{}");
+  const longAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+  await utimes(expired, longAgo, longAgo);
+
+  await smoke({ extension: fixture, required: loaded, checkOrder: true, copyPrompt: true, workspace });
+  assert.equal(await exists(expired), false, "Startup should prune guides past the age limit");
+  assert.equal(await exists(fresh), true, "Startup must keep recent guides");
+  console.log("Hunk validated and reordered a guide using real command snapshots and automatically copied its native content identities exactly once through the React pane.");
+  console.log("Hunk stored the guide under its content key and pruned an expired guide at startup.");
+
+  // A new Hunk process: the guide is found by native identities, not rewritten.
+  const before = (await readdir(guides)).sort();
+  await smoke({ extension: fixture, required: loaded, checkOrder: true, writeGuide: false, workspace });
+  assert.deepEqual((await readdir(guides)).sort(), before, "Reusing a guide must not write another");
+  console.log("A new Hunk session found and applied the cached guide without regenerating it.");
+
+  // Same repository, changed diff: no guide exists for it, and an earlier one does.
+  const changedPatch = join(workspace, "changed.patch");
+  await writeFile(changedPatch, (await readFile(join(root, "tests/fixtures/review.patch"), "utf8")).replace("toBe(true)", "toBe(1)"));
+  await smoke({ extension: fixture, required: ["Guided review", "Guide is out of date"], instrumented: true, writeGuide: false, workspace, patch: changedPatch });
+  console.log("A changed review reported the earlier guide as out of date.");
+} finally {
+  await rm(workspace, { recursive: true, force: true });
+}
+
+// A review with no local files behind it, like `gh pr diff | hunk patch -`. Hunk has
+// no sources to read, so the prompt must work through the session API alone, and a
+// later session must still find the guide by the review's native identities.
+// Hunk cannot reload a stdin review, so the guide groups the sidebar only and the
+// diff keeps its original order.
+const stdinOrder = ["src/api.ts", "tests/api.test.ts"];
+const pullRequest = await mkdtemp(join(tmpdir(), "hunk-review-smoke-"));
+try {
+  await smoke({ extension: fixture, required: loaded, checkOrder: true, copyPrompt: true, workspace: pullRequest, stdin: true, order: stdinOrder });
+  console.log("A stdin patch review produced a constant-size prompt and a content-keyed guide.");
+  const guides = join(pullRequest, ".cache", "hunk-review-plugin", "guides");
+  const before = (await readdir(guides)).sort();
+  assert.equal(before.length, 1, "One review should produce one guide");
+  await smoke({ extension: fixture, required: loaded, checkOrder: true, writeGuide: false, workspace: pullRequest, stdin: true, order: stdinOrder });
+  assert.deepEqual((await readdir(guides)).sort(), before, "A new stdin session must reuse the guide");
+  console.log("A new stdin patch session found and applied the cached guide.");
+} finally {
+  await rm(pullRequest, { recursive: true, force: true });
+}

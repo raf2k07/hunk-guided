@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-  reviewIdentities,
+  guideKey,
   sameContentIdentities,
   orderFiles,
   parseGuide,
@@ -27,8 +27,8 @@ function makeSection(files: string[], overrides: Partial<ReviewSection> = {}): R
 
 function makeGuide(files: readonly ReviewContentFile[], overrides: Partial<ReviewGuide> = {}): ReviewGuide {
   return {
-    schemaVersion: 2,
-    reviewFiles: reviewIdentities(files),
+    schemaVersion: 3,
+    reviewKey: guideKey(files),
     summary: "Review these changes.",
     sections: [makeSection(files.map((file) => file.path))],
     ...overrides,
@@ -46,8 +46,8 @@ function assertRejected(value: unknown, message: RegExp, reviewFiles: readonly R
   });
 }
 
-describe("native review identities", () => {
-  it("projects only captured native identities without recomputing them or mutating input", () => {
+describe("guideKey", () => {
+  it("is a 32-hex key derived only from native identities, without mutating input", () => {
     const input = Object.freeze(files.map((file, index) => Object.freeze({
       ...file,
       id: `runtime-${index}`,
@@ -56,15 +56,22 @@ describe("native review identities", () => {
       isBinary: true,
       metadata: { selected: true },
     })));
-    const projected = reviewIdentities(input);
-    assert.deepEqual(projected, files);
-    projected.forEach((file, index) => {
-      assert.notStrictEqual(file, input[index]);
-      assert.deepEqual(Object.keys(file).sort(), ["contentIdentity", "fileKey", "path"]);
-    });
-    assert.deepEqual(parseGuide(makeGuide(input), input).reviewFiles, files);
-    assert.deepEqual(reviewIdentities([]), []);
+    assert.match(guideKey(input), /^[0-9a-f]{32}$/);
+    assert.equal(guideKey(input), guideKey(files));
+    assert.equal(parseGuide(makeGuide(input), input).reviewKey, guideKey(files));
   });
+
+  it("does not depend on file order", () => {
+    assert.equal(guideKey(files), guideKey([...files].reverse()));
+  });
+
+  it("stays the same for a large review, so a prompt carrying it does not grow", () => {
+    const many = Array.from({ length: 5000 }, (_, index) => makeFile(`src/generated/file-${index}.ts`));
+    assert.equal(guideKey(many).length, 32);
+  });
+});
+
+describe("native review identities", () => {
 
   it("compares identities independently of file order without mutating input", () => {
     const input = Object.freeze([...files]);
@@ -110,8 +117,8 @@ describe("native review identities", () => {
     assert.equal(sameContentIdentities(duplicates, files), false);
     assert.equal(sameContentIdentities(files, duplicates), false);
     assert.equal(sameContentIdentities(duplicates, duplicates), false);
-    assertRejected(makeGuide(duplicates), /Duplicate review fileKey/);
     assert.throws(() => parseGuide(makeGuide(files), duplicates), StaleGuideError);
+    assert.throws(() => parseGuide(makeGuide(duplicates), files), StaleGuideError);
   });
 
   it("ignores runtime IDs, patches, stats, flags, and metadata when host contentIdentity is unchanged", () => {
@@ -125,7 +132,7 @@ describe("native review identities", () => {
       stats: { additions: 100, deletions: 50 }, isBinary: true, isTooLarge: true,
       isUntracked: true, metadata: { selected: true },
     }));
-    assert.deepEqual(reviewIdentities(first), reviewIdentities(second));
+    assert.equal(guideKey(first), guideKey(second));
     assert.equal(sameContentIdentities(first, second), true);
     assert.deepEqual(parseGuide(makeGuide(first), second), makeGuide(files));
   });
@@ -134,9 +141,7 @@ describe("native review identities", () => {
 describe("parseGuide schema validation", () => {
   it("accepts a valid guide even when the review files have been reordered", () => {
     const guide = makeGuide(files);
-    assert.deepEqual(parseGuide(guide, [...files].reverse()), {
-          ...guide, reviewFiles: reviewIdentities([...files].reverse()),
-        });
+    assert.deepEqual(parseGuide(guide, [...files].reverse()), guide);
   });
 
   for (const value of [null, undefined, false, 1, "guide", []]) {
@@ -145,7 +150,7 @@ describe("parseGuide schema validation", () => {
     });
   }
 
-  for (const schemaVersion of [undefined, null, "2", 0, 1, 3]) {
+  for (const schemaVersion of [undefined, null, "3", 0, 1, 2, 4]) {
     it(`rejects schemaVersion ${JSON.stringify(schemaVersion)}`, () => {
       assertRejected({ ...makeGuide(files), schemaVersion }, /Unsupported guide schemaVersion/);
     });
@@ -217,30 +222,27 @@ describe("parseGuide schema validation", () => {
   });
 });
 
-describe("guide identity validation", () => {
-  it("rejects a legacy schema 1 guide", () => {
+describe("guide review key validation", () => {
+  it("rejects legacy schema 1 and identity-array schema 2 guides", () => {
     assertRejected({ schemaVersion: 1, diffFingerprint: "0".repeat(64), summary: "Legacy guide", sections: [makeSection(files.map((file) => file.path))] }, /Unsupported guide schemaVersion/);
+    assertRejected({ ...makeGuide(files), schemaVersion: 2, reviewFiles: [] }, /Unsupported guide schemaVersion/);
   });
 
-  for (const reviewFiles of [undefined, null, 42, "", {}]) {
-    it(`rejects an invalid reviewFiles collection: ${JSON.stringify(reviewFiles)}`, () => {
-      assertRejected({ ...makeGuide(files), reviewFiles }, /reviewFiles must contain Hunk's content identities/);
+  for (const reviewKey of [undefined, null, 42, "", "abc", "A".repeat(32), "g".repeat(32), "a".repeat(31), "a".repeat(33), {}, []]) {
+    it(`rejects a missing or malformed reviewKey: ${JSON.stringify(reviewKey)}`, () => {
+      assertRejected({ ...makeGuide(files), reviewKey }, /reviewKey must be the 32-character reviewKey/);
     });
   }
 
-  for (const identity of [null, false, "identity", []]) {
-    it(`rejects a non-object review identity: ${JSON.stringify(identity)}`, () => {
-      assertRejected({ ...makeGuide(files), reviewFiles: [identity] }, /Review file 1 must be an object/);
-    });
-  }
+  it("rejects a well-formed key for different content as stale, not as a schema error", () => {
+    assert.throws(() => parseGuide({ ...makeGuide(files), reviewKey: "0".repeat(32) }, files), StaleGuideError);
+  });
 
-  for (const field of ["fileKey", "contentIdentity", "path"] as const) {
-    for (const value of [undefined, null, 42, ...(field === "path" ? [] : [""])]) {
-      it(`rejects invalid identity ${field}: ${JSON.stringify(value)}`, () => {
-        assertRejected({ ...makeGuide(files), reviewFiles: [{ ...files[0], [field]: value }, ...files.slice(1)] }, /must have fileKey, contentIdentity, and path strings/);
-      });
-    }
-  }
+  it("ignores a leftover reviewFiles array, since the key alone binds the guide", () => {
+    const parsed = parseGuide({ ...makeGuide(files), reviewFiles: [{ fileKey: "x" }] }, files);
+    assert.deepEqual(parsed, makeGuide(files));
+    assert.equal("reviewFiles" in parsed, false);
+  });
 
   it("rejects an old guide after identity or membership changes, but accepts a regenerated guide", () => {
     const guide = makeGuide(files);

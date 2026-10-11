@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ExtensionReviewSnapshotFile } from "hunkdiff/extension";
 
 export type ReviewContentFile = Pick<ExtensionReviewSnapshotFile, "fileKey" | "contentIdentity" | "path">;
@@ -10,16 +11,23 @@ export interface ReviewSection {
 }
 
 export interface ReviewGuide {
-  schemaVersion: 2;
-  reviewFiles: ReviewContentFile[];
+  schemaVersion: 3;
+  /** Echo of `guideKey()` for the review this guide was written for. */
+  reviewKey: string;
   summary: string;
   sections: ReviewSection[];
 }
 
 export class StaleGuideError extends Error {}
 
-export function reviewIdentities(files: readonly ReviewContentFile[]): ReviewContentFile[] {
-  return files.map(({ fileKey, contentIdentity, path }) => ({ fileKey, contentIdentity, path }));
+const REVIEW_KEY = /^[0-9a-f]{32}$/;
+
+// A short name for one review, derived only from Hunk's own identities. The prompt
+// carries this one value instead of every file's identities, so its size does not
+// grow with the diff. Equal keys mean equal native identities and paths.
+export function guideKey(files: readonly ReviewContentFile[]): string {
+  const entries = files.map((file) => JSON.stringify([file.fileKey, file.contentIdentity, file.path])).sort();
+  return createHash("sha256").update(JSON.stringify(entries)).digest("hex").slice(0, 32);
 }
 
 export function sameContentIdentities(left: readonly ReviewContentFile[], right: readonly ReviewContentFile[]): boolean {
@@ -54,18 +62,13 @@ function text(value: unknown, label: string, max: number): string {
 
 export function parseGuide(value: unknown, files: readonly ReviewContentFile[]): ReviewGuide {
   const root = record(value, "Guide");
-  if (root.schemaVersion !== 2) throw new Error("Unsupported guide schemaVersion; expected 2. Prepare a new review prompt.");
-  if (!Array.isArray(root.reviewFiles)) throw new Error("Guide reviewFiles must contain Hunk's content identities");
-  const identities = root.reviewFiles.map((value, index): ReviewContentFile => {
-    const file = record(value, `Review file ${index + 1}`);
-    if (typeof file.fileKey !== "string" || !file.fileKey || typeof file.contentIdentity !== "string" || !file.contentIdentity || typeof file.path !== "string") {
-      throw new Error("Review files must have fileKey, contentIdentity, and path strings");
-    }
-    return { fileKey: file.fileKey, contentIdentity: file.contentIdentity, path: file.path };
-  });
-  if (new Set(identities.map((file) => file.fileKey)).size !== identities.length) throw new Error("Duplicate review fileKey");
-  if (!sameContentIdentities(identities, files)) {
-    throw new StaleGuideError("Guide belongs to different review content. Prepare a new prompt and regenerate it.");
+  if (root.schemaVersion !== 3) throw new Error("Unsupported guide schemaVersion; expected 3. Copy a fresh review prompt.");
+  const reviewKey = root.reviewKey;
+  if (typeof reviewKey !== "string" || !REVIEW_KEY.test(reviewKey)) {
+    throw new Error("Guide reviewKey must be the 32-character reviewKey from the prompt");
+  }
+  if (reviewKey !== guideKey(files)) {
+    throw new StaleGuideError("Guide belongs to different review content. Copy a fresh review prompt and regenerate it.");
   }
   const summary = text(root.summary, "Guide summary", 4000);
   if (!Array.isArray(root.sections) || root.sections.length === 0 || root.sections.length > 1000) {
@@ -99,7 +102,7 @@ export function parseGuide(value: unknown, files: readonly ReviewContentFile[]):
     sections.push({ id: "other-changes", title: "Other changes",
       summary: "These files were not assigned by the agent. Review them separately.", files: remaining });
   }
-  return { schemaVersion: 2, reviewFiles: reviewIdentities(files), summary, sections };
+  return { schemaVersion: 3, reviewKey, summary, sections };
 }
 
 export function orderFiles<T extends { path: string }>(files: readonly T[], guide: ReviewGuide): T[] {

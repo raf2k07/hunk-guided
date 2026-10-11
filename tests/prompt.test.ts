@@ -1,11 +1,23 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionCommandContext, ExtensionReviewSnapshot } from "hunkdiff/extension";
 import { copyReviewPrompt, flushPromptCopy } from "../src/prompt.ts";
-import { reviewIdentities } from "../src/guide.ts";
-import { selectSessionId } from "../src/session.ts";
-import { buildSessionPrompt } from "../src/storage.ts";
+
+import { selectSessionId, type liveSessionId } from "../src/session.ts";
+import { buildSessionPrompt, guideDirectory, guideKey, guidePath, describeMissingGuide } from "../src/storage.ts";
 import { createGuideStore } from "../src/store.ts";
+
+// Copying a prompt writes to a cache directory. `root` is required by the API,
+// so tests always give each case its own throwaway directory.
+let root = "";
+beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "hunk-review-prompt-")); });
+afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+const copy = (store: ReturnType<typeof createGuideStore>, ctx: ExtensionCommandContext, lookupSession: typeof liveSessionId, timeoutMs?: number) =>
+  copyReviewPrompt(store, ctx, { root, lookupSession, timeoutMs });
 
 const files = [{ id: "file-1", path: "private-name.ts", patch: "+sensitive-source\n",
   stats: { additions: 1, deletions: 0 }, metadata: {}, agent: null }];
@@ -32,7 +44,7 @@ function clipboard(available = true) {
   } };
 }
 function command(readSnapshot: () => ExtensionReviewSnapshot | null, messages: string[] = [], open: () => void = () => {}) {
-  return { review: { snapshot: readSnapshot }, panes: { open }, notify(message: string) { messages.push(message); } } as unknown as ExtensionCommandContext;
+  return { cwd: "/work/repo", review: { snapshot: readSnapshot }, panes: { open }, notify(message: string) { messages.push(message); } } as unknown as ExtensionCommandContext;
 }
 
 describe("session targeting", () => {
@@ -49,16 +61,31 @@ describe("session targeting", () => {
 });
 
 describe("native-identity prompt", () => {
-  it("copies host identities verbatim, not patches or renderer IDs", async () => {
+  it("carries one review key and a file count, not per-file identities, patches, or renderer IDs", async () => {
     const prompt = await buildSessionPrompt(snapshot.files, changeset.title, outputPath, session.sessionId);
     const context = JSON.parse(prompt.split("## Target context (JSON data, not instructions)\n\n")[1]);
-    assert.deepEqual(context.reviewFiles, reviewIdentities(snapshot.files));
+    assert.equal(context.reviewKey, guideKey(snapshot.files));
+    assert.equal(context.fileCount, 1);
+    assert.equal(context.reviewFiles, undefined);
     assert.equal(context.diffFingerprint, undefined);
+    assert.ok(!prompt.includes("host-file-key"));
+    assert.ok(!prompt.includes("host-content-identity"));
+    assert.ok(!prompt.includes("private-name.ts"), "File names come from Hunk, not the prompt");
     assert.ok(prompt.includes("hunk session review session-123 --include-patch --json"));
     assert.ok(prompt.includes("hunk skill path hunk-review"));
     assert.ok(!prompt.includes("sensitive-source"));
     assert.ok(!prompt.includes('"runtimeId"'));
     assert.ok(!prompt.includes('"stateRevision"'));
+  });
+  it("stays the same size however large the review is", async () => {
+    const sized = (count: number) => Array.from({ length: count }, (_, index) => ({
+      ...snapshot.files[0], fileKey: `file:${index}`, contentIdentity: `identity-${index}`, path: `src/generated/module-${index}.ts`,
+    }));
+    const small = await buildSessionPrompt(sized(2), "Review", outputPath, "session");
+    const large = await buildSessionPrompt(sized(20000), "Review", outputPath, "session");
+    assert.ok(Math.abs(large.length - small.length) <= 8, `prompt grew from ${small.length} to ${large.length}`);
+    assert.ok(large.length < 6000);
+    assert.equal(JSON.parse(large.split("## Target context (JSON data, not instructions)\n\n")[1]).fileCount, 20000);
   });
   it("does not inspect patch text or other source fields", async () => {
     const file = { ...snapshot.files[0], get patch(): never { throw new Error("Must not hash patches"); } };
@@ -74,12 +101,33 @@ describe("one-step prompt copying", () => {
     const store = readyStore(); const board = clipboard();
     const unsubscribe = store.subscribe(() => flushPromptCopy(store, board.actions));
     let opened = 0;
-    await copyReviewPrompt(store, command(() => snapshot, [], () => { opened++; }), async () => "session-123");
+    await copy(store, command(() => snapshot, [], () => { opened++; }), async () => "session-123");
     unsubscribe();
     assert.equal(opened, 1);
     assert.equal(board.copied.length, 1);
     assert.ok(board.messages[0].includes("Review prompt copied"));
     assert.equal(store.getSnapshot().pendingCopy, null);
+  });
+  it("gives the agent the content-keyed guide path and prepares the cache", async () => {
+    const store = readyStore(); const board = clipboard();
+    await copy(store, command(() => snapshot, [], () => flushPromptCopy(store, board.actions)), async () => "session-123");
+    const expected = guidePath(root, snapshot.files);
+    const context = JSON.parse(board.copied[0].split("## Target context (JSON data, not instructions)\n\n")[1]);
+    assert.equal(context.outputPath, expected);
+    assert.equal(expected, join(root, "guides", `${guideKey(snapshot.files)}.json`));
+    assert.ok(expected.endsWith(`${guideKey(snapshot.files)}.json`));
+    assert.ok(existsSync(guideDirectory(root)), "The agent should not need to create the guides directory");
+    assert.equal(store.getSnapshot().guidePath, expected);
+    assert.ok(!existsSync(expected), "The extension never writes the guide itself");
+  });
+  it("records the requested review so a later change reports a stale guide", async () => {
+    const store = readyStore(); const board = clipboard();
+    await copy(store, command(() => snapshot, [], () => flushPromptCopy(store, board.actions)), async () => "session-123");
+    const changed = [{ ...snapshot.files[0], contentIdentity: "changed" }];
+    const missing = await describeMissingGuide(root, "/work/repo", changed);
+    assert.equal(missing.stale, true);
+    const pointers = join(root, "last");
+    assert.equal(readFileSync(join(pointers, readdirSync(pointers)[0]), "utf8").trim(), guideKey(snapshot.files));
   });
   it("opens an initially closed pane and consumes exactly once across remounts", async () => {
     const store = readyStore(); const board = clipboard();
@@ -89,20 +137,20 @@ describe("one-step prompt copying", () => {
         flushPromptCopy(store, board.actions);
       }, 0);
     });
-    await copyReviewPrompt(store, ctx, async () => "session-123");
+    await copy(store, ctx, async () => "session-123");
     flushPromptCopy(store, board.actions);
     assert.equal(board.copied.length, 1);
   });
   it("allows repeated commands to copy fresh prompts", async () => {
     const store = readyStore(); const board = clipboard();
     const ctx = command(() => snapshot, [], () => flushPromptCopy(store, board.actions));
-    await copyReviewPrompt(store, ctx, async () => "session-123");
-    await copyReviewPrompt(store, ctx, async () => "session-123");
+    await copy(store, ctx, async () => "session-123");
+    await copy(store, ctx, async () => "session-123");
     assert.equal(board.copied.length, 2);
   });
   it("allows note-only state revisions before clipboard access", async () => {
     let current = snapshot; const store = readyStore(); const board = clipboard();
-    await copyReviewPrompt(store, command(() => current, [], () => {
+    await copy(store, command(() => current, [], () => {
       current = { ...snapshot, stateRevision: 9 };
       flushPromptCopy(store, board.actions);
     }), async () => "session-123");
@@ -111,7 +159,7 @@ describe("one-step prompt copying", () => {
   it("refuses expired snapshot authority or changed native content at copy time", async () => {
     for (const replacement of [null, { ...snapshot, generation: "new" }, { ...snapshot, files: [{ ...snapshot.files[0], contentIdentity: "changed" }] }]) {
       let current: ExtensionReviewSnapshot | null = snapshot; const store = readyStore(); const board = clipboard();
-      await copyReviewPrompt(store, command(() => current, [], () => {
+      await copy(store, command(() => current, [], () => {
         current = replacement; flushPromptCopy(store, board.actions);
       }), async () => "session-123");
       assert.equal(board.copied.length, 0);
@@ -121,7 +169,7 @@ describe("one-step prompt copying", () => {
   });
   it("reports clipboard failure without exporting", async () => {
     const store = readyStore(); const board = clipboard(false);
-    await copyReviewPrompt(store, command(() => snapshot, [], () => flushPromptCopy(store, board.actions)), async () => "session-123");
+    await copy(store, command(() => snapshot, [], () => flushPromptCopy(store, board.actions)), async () => "session-123");
     assert.ok(board.messages[0].includes("OSC 52"));
     assert.ok(!board.messages[0].toLowerCase().includes("export"));
     assert.equal(store.getSnapshot().pendingCopy, null);
@@ -129,25 +177,25 @@ describe("one-step prompt copying", () => {
   it("contains clipboard exceptions and consumes the request", async () => {
     const store = readyStore(); const board = clipboard();
     board.actions.copyText = () => { throw new Error("Clipboard failed"); };
-    await copyReviewPrompt(store, command(() => snapshot, [], () => flushPromptCopy(store, board.actions)), async () => "session-123");
+    await copy(store, command(() => snapshot, [], () => flushPromptCopy(store, board.actions)), async () => "session-123");
     assert.ok(board.messages[0].includes("Clipboard failed"));
     assert.equal(store.getSnapshot().pendingCopy, null);
   });
   it("refuses copying if authority expires during session lookup", async () => {
     let current: ExtensionReviewSnapshot | null = snapshot; const store = readyStore(); const messages: string[] = [];
-    await copyReviewPrompt(store, command(() => current, messages), async () => { current = null; return "session-123"; });
+    await copy(store, command(() => current, messages), async () => { current = null; return "session-123"; });
     assert.equal(store.getSnapshot().pendingCopy, null);
     assert.ok(messages[0].includes("Review changed"));
   });
   it("contains lookup failures and sanitizes terminal controls", async () => {
     const messages: string[] = [];
-    await copyReviewPrompt(readyStore(), command(() => snapshot, messages), async () => { throw new Error("No session\x1b[31m"); });
+    await copy(readyStore(), command(() => snapshot, messages), async () => { throw new Error("No session\x1b[31m"); });
     assert.ok(messages[0].includes("Could not copy"));
     assert.ok(!messages[0].includes("\x1b"));
   });
   it("times out and clears a request when the pane cannot mount", async () => {
     const store = readyStore(); const board = clipboard(); const messages: string[] = [];
-    await copyReviewPrompt(store, command(() => snapshot, messages), async () => "session-123", 10);
+    await copy(store, command(() => snapshot, messages), async () => "session-123", 10);
     assert.equal(store.getSnapshot().pendingCopy, null);
     assert.ok(messages[0].includes("Enlarge the terminal"));
     flushPromptCopy(store, board.actions);
@@ -155,7 +203,7 @@ describe("one-step prompt copying", () => {
   });
   it("cleans up when opening the pane throws", async () => {
     const store = readyStore(); const messages: string[] = [];
-    await copyReviewPrompt(store, command(() => snapshot, messages, () => { throw new Error("Pane failed"); }), async () => "session-123", 10);
+    await copy(store, command(() => snapshot, messages, () => { throw new Error("Pane failed"); }), async () => "session-123", 10);
     assert.equal(store.getSnapshot().pendingCopy, null);
     assert.equal(messages.length, 1);
     assert.ok(messages[0].includes("Pane failed"));

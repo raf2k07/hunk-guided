@@ -1,11 +1,11 @@
 import { writeFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createElement, type ComponentType } from "react";
 import type { ExtensionDiffFile, ExtensionPaneProps, HunkExtensionAPI } from "hunkdiff/extension";
 import guidedReview from "../../src/index.tsx";
-import { reviewIdentities, sameContentIdentities } from "../../src/guide.ts";
-import { reviewPaths } from "../../src/storage.ts";
+import { guideKey } from "../../src/guide.ts";
+import { cacheRoot, ensureGuideDirectory, guidePath } from "../../src/storage.ts";
 import { liveSessionId } from "../../src/session.ts";
 
 // Hunk supplies real command snapshots and mounts the registered React pane.
@@ -15,7 +15,8 @@ export default function smoke(hunk: HunkExtensionAPI) {
   let copyCwd: string | null = null;
   const result: {
     sessionId?: string;
-    identities?: ReturnType<typeof reviewIdentities>;
+    reviewKey?: string;
+    fileCount?: number;
     copies: { text: string; success: boolean }[];
     commandCompleted: boolean;
     error?: string;
@@ -39,11 +40,11 @@ export default function smoke(hunk: HunkExtensionAPI) {
     hunk.registerCommand(command, async (ctx) => {
       const snapshot = ctx.review.snapshot();
       if (!snapshot) throw new Error("No real command snapshot");
-      if (command.id === "reload-guide") {
-        const paths = reviewPaths(ctx.cwd);
-        await mkdir(paths.directory, { recursive: true });
-        await writeFile(paths.guide, JSON.stringify({
-          schemaVersion: 2, reviewFiles: reviewIdentities(snapshot.files),
+      // SMOKE_WRITE_GUIDE=0 simulates a later session reusing a guide written earlier.
+      if (command.id === "reload-guide" && process.env.SMOKE_WRITE_GUIDE !== "0") {
+        await ensureGuideDirectory(cacheRoot());
+        await writeFile(guidePath(cacheRoot(), snapshot.files), JSON.stringify({
+          schemaVersion: 3, reviewKey: guideKey(snapshot.files),
           summary: "Authorization workflow smoke test",
           sections: [
             { id: "regression-tests", title: "Regression coverage", summary: "Test section explanation", files: ["tests/api.test.ts"] },
@@ -54,9 +55,10 @@ export default function smoke(hunk: HunkExtensionAPI) {
       if (command.id !== "copy-prompt") { await handler(ctx); return; }
       copyCwd = ctx.cwd;
       try {
-        const cached = JSON.parse(await readFile(reviewPaths(ctx.cwd).guide, "utf8"));
-        if (!sameContentIdentities(cached.reviewFiles, snapshot.files)) throw new Error("Hunk identities changed after file reordering");
-        result.identities = reviewIdentities(snapshot.files);
+        const cached = JSON.parse(await readFile(guidePath(cacheRoot(), snapshot.files), "utf8"));
+        if (cached.reviewKey !== guideKey(snapshot.files)) throw new Error("Hunk identities changed after file reordering");
+        result.reviewKey = guideKey(snapshot.files);
+        result.fileCount = snapshot.files.length;
         result.sessionId = await liveSessionId(snapshot.files.map((file) => ({ id: file.runtimeId, path: file.path })));
         await handler(ctx);
         result.commandCompleted = true;

@@ -36,10 +36,11 @@ export function createSidebar(store: GuideStore) {
             <box flexDirection="column" gap={1}>
               <text content={terminalText(state.message)} fg={theme.text} />
               <text content="Use Extensions → Copy review prompt and paste it into your agent. Your agent reads the live Hunk session; use Reload review guide when it is ready." fg={theme.muted} />
-              <text content={`Guide: ${terminalText(state.guidePath)}`} fg={theme.muted} />
+              {state.guidePath ? <text content={`Guide: ${terminalText(state.guidePath)}`} fg={theme.muted} /> : null}
             </box>
           ) : (
             <>
+              {state.message ? <text content={terminalText(state.message)} fg={theme.muted} /> : null}
               <text content={terminalText(state.guide.summary)} fg={theme.text} />
               {state.guide.sections.map((section, index) => {
                 const active = section.id === activeSection?.id;

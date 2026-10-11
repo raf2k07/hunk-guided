@@ -1,17 +1,32 @@
 import type { ExtensionCommandContext, ExtensionPaneActions } from "hunkdiff/extension";
 import { sameContentIdentities, terminalText } from "./guide.ts";
 import { liveSessionId } from "./session.ts";
-import { buildSessionPrompt } from "./storage.ts";
+import { buildSessionPrompt, ensureGuideDirectory, guideKey, guidePath, pruneGuides, rememberReview } from "./storage.ts";
 import type { GuideStore } from "./store.ts";
 
-export async function copyReviewPrompt(store: GuideStore, ctx: ExtensionCommandContext, lookupSession = liveSessionId, timeoutMs = 5000): Promise<void> {
+export interface CopyPromptOptions {
+  /** Cache directory for guides and last-review pointers; always explicit. */
+  root: string;
+  lookupSession?: typeof liveSessionId;
+  timeoutMs?: number;
+}
+
+export async function copyReviewPrompt(store: GuideStore, ctx: ExtensionCommandContext, { root, lookupSession = liveSessionId, timeoutMs = 5000 }: CopyPromptOptions): Promise<void> {
   const snapshot = ctx.review.snapshot();
   const state = store.getSnapshot();
   if (!snapshot?.files.length || !state.changeset) { ctx.notify("No review snapshot available", "warning"); return; }
-    if (state.pendingCopy) { ctx.notify("A review prompt copy is already pending", "warning"); return; }
+  if (state.pendingCopy) { ctx.notify("A review prompt copy is already pending", "warning"); return; }
   try {
     const sessionId = await lookupSession(snapshot.files.map((file) => ({ id: file.runtimeId, path: file.path })));
-    const text = await buildSessionPrompt(snapshot.files, state.changeset.title, state.guidePath, sessionId);
+    const outputPath = guidePath(root, snapshot.files);
+    const text = await buildSessionPrompt(snapshot.files, state.changeset.title, outputPath, sessionId);
+    // Cache housekeeping is best-effort. It runs before the freshness check below so
+    // no await separates that check from posting the request.
+    await Promise.allSettled([
+      ensureGuideDirectory(root),
+      rememberReview(root, ctx.cwd, snapshot.files),
+      pruneGuides(root, { keep: new Set([guideKey(snapshot.files)]) }),
+    ]);
     const current = ctx.review.snapshot();
     if (!current || current.generation !== snapshot.generation || !sameContentIdentities(snapshot.files, current.files) || store.getSnapshot() !== state) {
       ctx.notify("Review changed; copy a fresh prompt", "warning"); return;
@@ -26,7 +41,7 @@ export async function copyReviewPrompt(store: GuideStore, ctx: ExtensionCommandC
         resolve();
       }, timeoutMs);
       try {
-        store.set({ ...state, pendingCopy: request });
+        store.set({ ...state, guidePath: outputPath, pendingCopy: request });
         ctx.panes.open("guide");
       } catch (error) {
         if (store.getSnapshot().pendingCopy === request) store.set({ ...store.getSnapshot(), pendingCopy: null });
